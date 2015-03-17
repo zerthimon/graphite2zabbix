@@ -99,7 +99,7 @@ def get_last_val(datapoints):
     """
 
     for datapoint in reversed(datapoints):
-        if datapoint[0]:
+        if datapoint[0] is not None:
             return datapoint
     return None
 
