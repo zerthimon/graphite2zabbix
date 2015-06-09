@@ -28,12 +28,13 @@
 # Zabbix
 #     http://www.zabbix.com/
 
+__author__ = 'Lior Goikhburg'
 
 import argparse
-import base64
 import logging
 import json
 import os
+import re
 import requests
 import sys
 import time
@@ -118,18 +119,6 @@ def parse_zabbix_info(info):
     return info_parsed
 
 
-def decode_base64(string):
-    """
-    Decode base64 url safe string, add padding if needed
-
-    """
-
-    missing_padding = 4 - len(string) % 4
-    if missing_padding:
-        string += '=' * missing_padding
-    return base64.urlsafe_b64decode(str(string))
-
-
 def send_zabbix(traps):
     """
     Submit traps to Zabbix
@@ -156,6 +145,71 @@ def send_zabbix(traps):
         logger.warning("%i traps were not accepted by Zabbix" % info_parsed['failed'])
     
     return True
+
+
+# extract metric name from zabbix key name
+def extract_metric(zapi, item):
+    """
+    Extract metric name from key, resolve user macros if any
+    """
+
+    global item_cache
+    key = item['key_']
+
+    # resolve macros in key
+    macros = zabbix_macro_re.findall(key)
+    if macros:
+        logger.debug("Key %s has user macros. Expansion is needed." % key)
+        macro_dict = {element: '' for element in macros}
+
+        # look up macros:
+        # 1. host
+        # 2. directly linked template (to host)
+        # 3. a template linked to template etc, etc.
+        process = True
+        while process:
+            hostid = item['hostid']
+            try:
+                user_macros = zapi.usermacro.get(output=['macro', 'value'],
+                                                 hostids=[hostid])
+            except Exception as error:
+                logger.error("Zabbix API Error: %s", error.message)
+                return ''
+
+            for user_macro in user_macros:
+                macro_name = user_macro['macro']
+                macro_value = user_macro['value']
+                if macro_name in macro_dict and not macro_dict[macro_name]:
+                    logger.debug("Resolved User macro %s to %s" % (macro_name, macro_value))
+                    macro_dict[macro_name] = macro_value
+
+            parentid = item['templateid']
+            if parentid == '0':
+                process = False
+            else:
+                # fetch item from cache, or request from api
+                if parentid not in item_cache:
+                    try:
+                        item_cache[parentid] = zapi.item.get(output=['hostid', 'templateid'],
+                                                             itemids=[parentid])[0]
+                    except Exception as error:
+                        logger.error("Zabbix API Error: %s", error.message)
+                        return ''
+                item = item_cache[parentid]
+
+        for macro_name, macro_value in macro_dict.iteritems():
+            if not macro_value:
+                logger.warning("Failed to resolve a user macro %s in key %s - skipping it." %
+                               (macro_name, key))
+                return ''
+            key = key.replace(macro_name, macro_value)
+
+    # extract metric part
+    match = metric_name_re.search(key)
+    metric = ''
+    if match and len(match.groups()) == 1:
+        metric = match.group(1)
+    return metric
 
 
 def main():
@@ -186,7 +240,8 @@ def main():
     try:
         zhosts = zapi.host.get(output='shorten',
                                monitored_hosts=True,
-                               with_items=True)
+                               with_items=True,
+                               )
     except Exception as error:
         logger.error("Zabbix API Error: %s", error.message)
         return False
@@ -206,9 +261,10 @@ def main():
     # 1. Item id
     # 2. key_ name
     # 3. host id of the linked host
+    # 4. templateid id of the parent ITEM
     logger.debug('Looking for zabbix items')
     try:
-        zitems = zapi.item.get(output=['key_'],
+        zitems = zapi.item.get(output=['key_', 'hostid', 'templateid'],
                                filter={'type': 2},
                                search={'key_': config['zabbix']['key_prefix']},
                                startSearch=True,
@@ -227,22 +283,18 @@ def main():
     # Create dict of dicts of zabbix data (only missing values)
     zabbix_data = {}
     for item in zitems:
-        key = item['key_']
-
-        # check if key is encoded
-        key_sections = key.partition('encoded.')
-        if key_sections[1]:
-            decoded_key = key_sections[0] + decode_base64(key_sections[2])
-            logger.debug("Zabbix key %s decoded into %s" % (key, decoded_key))
-        else:
-            decoded_key = key
-
         fqdn = item['hosts'][0]['name']
-        hostname = fqdn.rsplit('.')[0]
 
-        # replace decoded_key prefix by hostname
-        metric = decoded_key.replace(config['zabbix']['key_prefix'], hostname)
-        zabbix_data[metric] = {'host': fqdn, 'key': key, 'clock': int(time.time())}
+        hostname = fqdn.partition('.')[0]
+
+        logger.debug("Processing Key: %s:%s" % (fqdn, item['key_']))
+        metric = extract_metric(zapi, item)
+        if not metric:
+            logger.warning("Incorrectly configured key %s" % item['key_'])
+            continue
+
+        metric = "%s.%s" % (hostname, metric)
+        zabbix_data[metric] = {'host': fqdn, 'key': item['key_'], 'clock': int(time.time())}
 
     graphite = Graphite(host=config['graphite']['host'],
                         port=config['graphite']['port'],
@@ -290,7 +342,7 @@ def main():
 if __name__ == '__main__':
     config = {
         'zabbix': {
-            'key_prefix': 'graphite_metric',
+            'key_prefix': 'graphite.metric',
             'api': {
                 'host': 'zabbix.host.com',
                 'port': '443',
@@ -315,6 +367,10 @@ if __name__ == '__main__':
             'period': '-3minutes'
         }
     }
+
+    metric_name_re = re.compile(r'\[([^\[]+)\]')
+    zabbix_macro_re = re.compile(r'{\$[^}]+}')
+    item_cache = {}
 
     parser = argparse.ArgumentParser(prog=os.path.basename(__file__),
                                      description='Graphite 2 Zabbix Bridge',
